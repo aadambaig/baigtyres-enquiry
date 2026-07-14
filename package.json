@@ -2,6 +2,9 @@
   "name": "baigtyres-services",
   "version": "3.0.0",
   "private": true,
+  "scripts": {
+    "build": "echo 'No build needed — static site'"
+  },
   "dependencies": {
     "nodemailer": "^6.9.14"
   }
