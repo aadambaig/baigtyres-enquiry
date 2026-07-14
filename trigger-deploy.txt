@@ -1,1 +1,3 @@
-Trigger first Vercel deploy
+This file was used to trigger the first Vercel git-connected deployment.
+Updated by Claude via Zapier to confirm write access works end-to-end.
+Safe to delete at any time.
