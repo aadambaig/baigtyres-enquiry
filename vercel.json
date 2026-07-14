@@ -44,6 +44,11 @@
   ],
   "redirects": [
     {
+      "source": "/services/custom-exhausts",
+      "destination": "https://enquiries.baigtyres.com/services/performance-exhausts",
+      "permanent": true
+    },
+    {
       "source": "/(.*)",
       "has": [
         {
