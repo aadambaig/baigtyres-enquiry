@@ -44,14 +44,14 @@
   ],
   "redirects": [
     {
-      "source": "/:path*",
+      "source": "/(.*)",
       "has": [
         {
           "type": "host",
           "value": "baigtyres-services.vercel.app"
         }
       ],
-      "destination": "https://enquiries.baigtyres.com/:path*",
+      "destination": "https://enquiries.baigtyres.com/$1",
       "permanent": true
     }
   ]
