@@ -2,4 +2,4 @@ User-agent: *
 Allow: /
 Disallow: /api/
 
-Sitemap: https://baigtyres-services.vercel.app/sitemap.xml
+Sitemap: https://enquiries.baigtyres.com/sitemap.xml
