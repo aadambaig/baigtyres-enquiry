@@ -6,6 +6,7 @@
     "build": "echo 'No build needed — static site'"
   },
   "dependencies": {
+    "@vercel/speed-insights": "^2.0.0",
     "nodemailer": "^6.9.14"
   }
 }
