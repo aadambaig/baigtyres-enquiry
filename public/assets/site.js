@@ -582,7 +582,10 @@
 
   if (!optedIn()) {
     document.body.classList.add('has-tab');
-    if (!dismissed()) setTimeout(openModal, 1400);
+    // Keep the offer available without interrupting the initial mobile visit.
+    if (!dismissed() && window.matchMedia('(min-width: 768px)').matches) {
+      setTimeout(openModal, 8000);
+    }
   }
 
   var modalX = document.getElementById('modalX');
