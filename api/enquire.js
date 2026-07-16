@@ -1,12 +1,19 @@
-// POST /api/enquire — validate, spam-guard, capture to a durable queue, email instantly, confirm to customer.
+// POST /api/enquire — validate, spam-guard, capture, email instantly, confirm to customer.
 //
 // Delivery strategy (capture is always guaranteed; email is best-effort):
-//   1) Durable capture: append the enquiry to the queue blob so no lead is ever lost.
+//   1) Durable capture: write the full enquiry to Vercel's runtime logs (structured,
+//      prefixed ENQUIRY_BACKUP) so nothing is silently lost even if every email path
+//      is down. This used to be a third-party JSON blob (jsonblob.com) — removed
+//      2026-07-13 after discovering jsonblob expires blobs (observed 24h from
+//      creation) and had gone dead, meaning the "durable" queue had actually been
+//      capturing nothing for some time. Logging to Vercel has no such expiry cliff
+//      and needs no external dependency, though it's a recovery record for someone
+//      to grep, not an auto-replaying queue. For true auto-retry durability, wire
+//      this into Vercel KV/Postgres or another real datastore.
 //   2) Instant business email to PRIMARY_TO via, in order of preference:
 //        a) Gmail SMTP (App Password)  — sends from the real business inbox.
 //        b) Resend / Brevo transactional API — if a key is configured instead.
 //   3) Automatic confirmation email to the customer (same transport), if we have their email.
-//   4) A relay worker also forwards anything still undelivered in the queue (belt and braces).
 // The HTTP response is a success as long as the enquiry was captured OR emailed.
 const CONFIG = require('./_config.js');
 
@@ -90,25 +97,17 @@ function htmlEscape(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-async function enqueue(cfg, record) {
-  // Read-modify-write the queue blob with one retry to reduce race loss on low volume.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const gr = await fetch(cfg.QUEUE_BLOB, { headers: { Accept: 'application/json' } });
-      if (!gr.ok) throw new Error('queue_get_' + gr.status);
-      const data = await gr.json();
-      if (!data || !Array.isArray(data.queue)) throw new Error('queue_shape');
-      data.queue.push(record);
-      if (data.queue.length > 2000) data.queue = data.queue.slice(-2000);
-      const pr = await fetch(cfg.QUEUE_BLOB, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify(data)
-      });
-      if (pr.ok) return true;
-    } catch (e) { /* retry once */ }
+function enqueue(cfg, record) {
+  // Durable capture without an external dependency: log a structured, greppable
+  // line to Vercel's own runtime logs. console.log on a serverless invocation is
+  // about as close to "can't fail" as this stack gets — if the runtime is broken
+  // enough for this to throw, nothing else in the request would have worked either.
+  try {
+    console.log('ENQUIRY_BACKUP:' + JSON.stringify(record));
+    return true;
+  } catch (e) {
+    return false;
   }
-  return false;
 }
 
 /* ---------- Email bodies ---------- */
@@ -323,20 +322,6 @@ module.exports = async (req, res) => {
         await sendVia(cfg, { to: email, subject: cust.subject, text: cust.text, html: cust.html, replyTo: cfg.PRIMARY_TO });
       } catch (e) { /* confirmation is non-critical */ }
     }
-  }
-
-  // If the email was delivered straight away, mark the queued copy delivered so the relay skips it.
-  if (emailed && captured) {
-    try {
-      const gr = await fetch(cfg.QUEUE_BLOB, { headers: { Accept: 'application/json' } });
-      if (gr.ok) {
-        const data = await gr.json();
-        if (data && Array.isArray(data.queue)) {
-          const item = data.queue.find((x) => x.id === record.id);
-          if (item) { item.delivered = true; await fetch(cfg.QUEUE_BLOB, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }); }
-        }
-      }
-    } catch (e) { /* relay will handle it */ }
   }
 
   if (captured || emailed) res.status(200).json({ ok: true });
