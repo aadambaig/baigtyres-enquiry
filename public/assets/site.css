@@ -233,7 +233,7 @@ body[data-page="alloy-wheel-repair"] .figure{background:#0c1013;}
 body[data-page="alloy-wheel-repair"] .figure::before{content:"";position:absolute;inset:0;background:url(/assets/wheel-straightening-machine.jpg) center/cover no-repeat;filter:blur(26px) brightness(.55);transform:scale(1.15);z-index:0;}
 body[data-page="alloy-wheel-repair"] .figure img{position:relative;z-index:1;aspect-ratio:3/4;object-fit:contain;filter:none;}
 body[data-page="alloy-wheel-repair"] .figure figcaption{z-index:2;}
-@media(max-width:640px){body[data-page="alloy-wheel-repair"] .figure img{aspect-ratio:1/1;}}
+@media(max-width:640px){body[data-page="alloy-wheel-repair"] .figure img{aspect-ratio:3/4;}}
 .spec-row{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:12px;}
 @media(min-width:640px){.spec-row{grid-template-columns:repeat(4,1fr);}}
 .spec{border:1px solid var(--line);background:rgba(11,16,21,0.6);border-radius:var(--r);padding:12px;}
