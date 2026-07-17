@@ -1,6 +1,6 @@
 /* Baig Tyres — shared site JS */
 (function(){
-  var rm = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  document.documentElement.classList.add('js');var rm = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   var PAGE = document.body.dataset.page || 'home';
 
   /* ---------- Reveal animations ---------- */
