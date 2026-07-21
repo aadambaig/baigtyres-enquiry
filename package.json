@@ -6,6 +6,7 @@
     "build": "echo 'No build needed — static site'"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.110.7",
     "@vercel/analytics": "^2.0.1",
     "nodemailer": "^6.9.14"
   }

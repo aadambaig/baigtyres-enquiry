@@ -1,15 +1,8 @@
 // POST /api/enquire — validate, spam-guard, capture, email instantly, confirm to customer.
 //
-// Delivery strategy (capture is always guaranteed; email is best-effort):
-//   1) Durable capture: write the full enquiry to Vercel's runtime logs (structured,
-//      prefixed ENQUIRY_BACKUP) so nothing is silently lost even if every email path
-//      is down. This used to be a third-party JSON blob (jsonblob.com) — removed
-//      2026-07-13 after discovering jsonblob expires blobs (observed 24h from
-//      creation) and had gone dead, meaning the "durable" queue had actually been
-//      capturing nothing for some time. Logging to Vercel has no such expiry cliff
-//      and needs no external dependency, though it's a recovery record for someone
-//      to grep, not an auto-replaying queue. For true auto-retry durability, wire
-//      this into Vercel KV/Postgres or another real datastore.
+// Delivery strategy:
+//   1) Durable capture: write the enquiry to Supabase before trying email. Runtime
+//      logs remain a short-retention recovery trace, not durable storage.
 //   2) Instant business email to PRIMARY_TO via, in order of preference:
 //        a) Gmail SMTP (App Password)  — sends from the real business inbox.
 //        b) Resend / Brevo transactional API — if a key is configured instead.
@@ -19,6 +12,9 @@ const CONFIG = require('./_config.js');
 
 let nodemailer = null;
 try { nodemailer = require('nodemailer'); } catch (e) { nodemailer = null; }
+
+let createClient = null;
+try { ({ createClient } = require('@supabase/supabase-js')); } catch (e) { createClient = null; }
 
 const hits = new Map();
 const WINDOW_MS = 10 * 60 * 1000;
@@ -98,16 +94,57 @@ function htmlEscape(s) {
 }
 
 function enqueue(cfg, record) {
-  // Durable capture without an external dependency: log a structured, greppable
-  // line to Vercel's own runtime logs. console.log on a serverless invocation is
-  // about as close to "can't fail" as this stack gets — if the runtime is broken
-  // enough for this to throw, nothing else in the request would have worked either.
+  // Diagnostic recovery trace only. Vercel retains these logs for a limited time.
   try {
     console.log('ENQUIRY_BACKUP:' + JSON.stringify(record));
     return true;
   } catch (e) {
     return false;
   }
+}
+
+let supabase = null;
+let supabaseKey = '';
+function getSupabase(cfg) {
+  if (!createClient || !cfg.SUPABASE_URL || !cfg.SUPABASE_SERVICE_ROLE_KEY) return null;
+  const key = cfg.SUPABASE_URL + '|' + cfg.SUPABASE_SERVICE_ROLE_KEY;
+  if (supabase && supabaseKey === key) return supabase;
+  try {
+    supabase = createClient(cfg.SUPABASE_URL, cfg.SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false }
+    });
+    supabaseKey = key;
+    return supabase;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function persistEnquiry(cfg, record) {
+  const db = getSupabase(cfg);
+  if (!db) return false;
+  const { error } = await db.from('enquiries').insert({
+    id: record.id,
+    name: record.name,
+    contact: { phone: record.phone, email: record.email },
+    vehicle_registration: record.registration,
+    service_requested: record.services ? record.services.split(', ') : [],
+    message: record.message,
+    submitted_at: record.ts,
+    email_sent: false
+  });
+  if (!error) return true;
+  console.error('ENQUIRY_PERSIST_FAILED:' + JSON.stringify({ id: record.id, message: error.message }));
+  return false;
+}
+
+async function markEmailSent(cfg, id) {
+  const db = getSupabase(cfg);
+  if (!db) return false;
+  const { error } = await db.from('enquiries').update({ email_sent: true }).eq('id', id);
+  if (!error) return true;
+  console.error('ENQUIRY_EMAIL_FLAG_FAILED:' + JSON.stringify({ id: id, message: error.message }));
+  return false;
 }
 
 /* ---------- Email bodies ---------- */
@@ -299,7 +336,14 @@ module.exports = async (req, res) => {
     delivered: false
   };
 
-  // 1) Durable capture — the primary guarantee.
+  // 1) Durable capture happens before any network email attempt. If the database
+  // is unavailable, continue trying email but leave an explicit runtime error.
+  let persisted = false;
+  try { persisted = await persistEnquiry(cfg, record); } catch (e) {
+    console.error('ENQUIRY_PERSIST_FAILED:' + JSON.stringify({ id: record.id, message: e && e.message ? e.message : 'unknown' }));
+  }
+
+  // Keep a short-retention recovery trace alongside the database row.
   const captured = await enqueue(cfg, record);
 
   // 2) Instant business email + 3) customer confirmation (best-effort).
@@ -324,8 +368,14 @@ module.exports = async (req, res) => {
     }
   }
 
-  // `captured` is only a console.log line (1hr–1day retention on Vercel, nobody watches it) —
-  // gate real success on the actual business-notification email, not the log fallback.
+  if (emailed && persisted) {
+    try { await markEmailSent(cfg, record.id); } catch (e) {
+      console.error('ENQUIRY_EMAIL_FLAG_FAILED:' + JSON.stringify({ id: record.id, message: e && e.message ? e.message : 'unknown' }));
+    }
+  }
+
+  // The customer-facing success state remains gated on the actual business email,
+  // not on the recovery log or database row.
   // Fixed 2026-07-21: previously `captured || emailed` meant a broken email transport
   // silently told every customer "we've got it" while the business received nothing.
   if (emailed) res.status(200).json({ ok: true });

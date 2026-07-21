@@ -12,8 +12,6 @@
 const STATIC = {
   // Enquiry delivery.
   PRIMARY_TO: 'enquiries.baigtyres@gmail.com',            // the business inbox (FormSubmit activation click enables direct delivery)
-  MIRROR_TO: '879a714de78a33e7f7ff4dceaf23dfa9',          // activated FormSubmit alias -> owner's Gmail (already live)
-  SITE_ORIGIN: 'https://baigtyres-services.vercel.app',
 
   // ---- Email delivery ----
   // Preferred: send straight from the business Gmail over SMTP using a Google App Password.
@@ -38,7 +36,12 @@ const STATIC = {
   MOT_CLIENT_SECRET: '',
   MOT_API_KEY: '',
   MOT_SCOPE_URL: 'https://tapi.dvsa.gov.uk/.default',
-  MOT_TOKEN_URL: ''
+  MOT_TOKEN_URL: '',
+
+  // Durable enquiry storage. Use the service-role key only in this server-side
+  // function; never expose it to the browser as a NEXT_PUBLIC/VITE variable.
+  SUPABASE_URL: '',
+  SUPABASE_SERVICE_ROLE_KEY: ''
 };
 
 let cached = null;
