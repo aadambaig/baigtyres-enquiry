@@ -324,8 +324,12 @@ module.exports = async (req, res) => {
     }
   }
 
-  if (captured || emailed) res.status(200).json({ ok: true });
-  else res.status(502).json({ error: 'delivery_failed' });
+  // `captured` is only a console.log line (1hr–1day retention on Vercel, nobody watches it) —
+  // gate real success on the actual business-notification email, not the log fallback.
+  // Fixed 2026-07-21: previously `captured || emailed` meant a broken email transport
+  // silently told every customer "we've got it" while the business received nothing.
+  if (emailed) res.status(200).json({ ok: true });
+  else res.status(502).json({ error: 'delivery_failed', captured: captured });
 };
 
 // Reference photos are base64-encoded in the JSON body. NOTE: Vercel hard-caps the actual
