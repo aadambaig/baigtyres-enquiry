@@ -44,6 +44,8 @@ img{display:block;max-width:100%;}
 .bg-photo.on{opacity:0.61;}
 /* Alloy wheels page — a further ~5% brightness/contrast on top of the shared bump above */
 body[data-page="alloy-wheels"] .bg-photo{filter:brightness(1.25) contrast(1.26);}
+/* Wheel repair page — the welding photo remains visible but deliberately subdued behind the content. */
+body[data-page="alloy-wheel-repair"] .bg-photo{filter:brightness(.86) contrast(.68) saturate(.78);}
 .bg-scrim{position:fixed;inset:0;z-index:-1;pointer-events:none;
   background:
     linear-gradient(90deg, rgba(6,9,13,0.72) 0%, rgba(6,9,13,0.42) 45%, rgba(6,9,13,0.58) 100%),
