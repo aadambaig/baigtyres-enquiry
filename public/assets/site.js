@@ -595,25 +595,33 @@
   if (veil) veil.addEventListener('click',function(e){ if(e.target===veil){ markDismiss(); closeModal(); } });
 
   function submitOptin(contact){
-    if(!contact) return Promise.resolve();
+    if(!contact) return Promise.resolve(false);
     var isEmail = contact.indexOf('@') !== -1;
     return fetch('/api/enquire',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({ firstName:'', lastName:'', phone:isEmail ? '' : contact, email: isEmail ? contact : '',
         registration:'', services:[], message:'', marketing_optin:true, company:'', source:'optin_popup', page: PAGE })
-    }).catch(function(){});
+    }).then(function(res){ return res.ok; }).catch(function(){ return false; });
   }
 
   var modalGo = document.getElementById('modalGo');
+  var modalErr = document.getElementById('modalErr');
   if (modalGo) modalGo.addEventListener('click', function(){
     var c=document.getElementById('modalContact').value.trim();
     if(!c) return;
     modalGo.disabled = true;
-    submitOptin(c).then(function(){
-      document.getElementById('modalForm').style.display='none';
-      document.getElementById('modalDone').style.display='block';
-      markOptin(); hideTab();
-      setTimeout(closeModal, 3600);
+    if (modalErr) modalErr.classList.remove('show');
+    submitOptin(c).then(function(success){
+      modalGo.disabled = false;
+      if (success) {
+        document.getElementById('modalForm').style.display='none';
+        document.getElementById('modalDone').style.display='block';
+        markOptin(); hideTab();
+        setTimeout(closeModal, 3600);
+      } else if (modalErr) {
+        modalErr.textContent = "That didn't send — call us on 01905 731396 or try again.";
+        modalErr.className = 'result show err';
+      }
     });
   });
 
