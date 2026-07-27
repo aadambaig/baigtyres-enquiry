@@ -3,7 +3,8 @@
   "version": "3.0.0",
   "private": true,
   "scripts": {
-    "build": "echo 'No build needed — static site'"
+    "build": "echo 'No build needed — static site'",
+    "test": "node tests/health-check.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.7",
