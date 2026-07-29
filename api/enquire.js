@@ -8,6 +8,16 @@
 //        b) Resend / Brevo transactional API — if a key is configured instead.
 //   3) Automatic confirmation email to the customer (same transport), if we have their email.
 // The HTTP response is a success as long as the enquiry was captured OR emailed.
+//
+// PROTECTED HEALTH-CHECK MODE: a request only enters health-check mode when it carries
+// BOTH `synthetic_health_check: true` in the body AND a header `x-health-check-secret`
+// matching the Vercel env var HEALTH_CHECK_SECRET. It runs the exact same validation
+// (validateEnquiryFields), record-building (buildRecord), and persistence (persistEnquiry)
+// code paths as a real enquiry, using fixed, obviously-synthetic field values that never
+// come from the request body — then reads the row back, deletes it, and returns a
+// structured multi-stage JSON result. It never sends email and never reaches the code
+// below it in the normal flow. See handleHealthCheck().
+const crypto = require('crypto');
 const CONFIG = require('./_config.js');
 
 let nodemailer = null;
@@ -40,19 +50,10 @@ function ukMobileValid(v) {
 }
 const PHONE_RE = { test: ukMobileValid };
 const DATA_URL_RE = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/;
-// Vercel hard-caps the whole request body at 4.5MB and that ceiling is NOT configurable —
-// bodyParser.sizeLimit below only tells our own code how much to accept, it can't raise the
-// platform limit. The old single-photo cap here (7,000,000 base64 chars ≈ 5.25MB raw) was
-// already bigger than the platform allows on its own, before even counting the rest of the
-// JSON body — a customer with one big enough photo could have silently hit a 413 from
-// Vercel's edge, never reaching this code. Tightened per-image and added a combined cap so
-// up to MAX_IMAGES photos together stay comfortably under the real 4.5MB ceiling.
 const MAX_IMAGES = 5;
-const MAX_IMAGE_BASE64_CHARS = 1_200_000; // ~900KB raw per photo — client compresses well under this
-const MAX_TOTAL_IMAGE_BASE64_CHARS = 4_200_000; // ~3.15MB raw combined, leaves headroom under Vercel's 4.5MB body cap
+const MAX_IMAGE_BASE64_CHARS = 1_200_000;
+const MAX_TOTAL_IMAGE_BASE64_CHARS = 4_200_000;
 
-// Reference photo uploads arrive as { data: 'data:image/jpeg;base64,...', name }.
-// Returns a nodemailer-ready attachment, or null if absent/invalid/oversized (never blocks the enquiry).
 function parseImageAttachment(image) {
   if (!image || typeof image !== 'object') return null;
   const data = typeof image.data === 'string' ? image.data : '';
@@ -66,10 +67,6 @@ function parseImageAttachment(image) {
   return { filename: safeName, content: base64, encoding: 'base64', contentType: mime };
 }
 
-// Reference photos arrive as up to MAX_IMAGES { data, name } objects. Validates and caps
-// each one, and enforces a combined-size budget across all of them — anything that doesn't
-// fit is dropped silently rather than failing the whole enquiry (same philosophy as the
-// single-image version above).
 function parseImageAttachments(images) {
   if (!Array.isArray(images)) return [];
   let totalChars = 0;
@@ -94,7 +91,6 @@ function htmlEscape(s) {
 }
 
 function enqueue(cfg, record) {
-  // Diagnostic recovery trace only. Vercel retains these logs for a limited time.
   try {
     console.log('ENQUIRY_BACKUP:' + JSON.stringify(record));
     return true;
@@ -147,7 +143,51 @@ async function markEmailSent(cfg, id) {
   return false;
 }
 
-/* ---------- Email bodies ---------- */
+function validateEnquiryFields(f) {
+  if (f.isOptinOnly) {
+    if (!f.email && !f.phone) return 'contact_required';
+    if (f.email && !EMAIL_RE.test(f.email)) return 'bad_email';
+    if (f.phone && !PHONE_RE.test(f.phone)) return 'bad_phone';
+    return null;
+  }
+  if (!f.firstName || !f.lastName) return 'name_required';
+  if (!PHONE_RE.test(f.phone)) return 'bad_phone';
+  if (!EMAIL_RE.test(f.email)) return 'bad_email';
+  if (!PLATE_RE.test(f.registration)) return 'bad_registration';
+  if (f.services.length === 0) return 'services_required';
+  return null;
+}
+
+function buildRecord(f, idPrefix) {
+  const prefix = idPrefix || 'e';
+  const vehicleLine = f.vehicle
+    ? [f.vehicle.make, f.vehicle.model, f.vehicle.colour, f.vehicle.year, f.vehicle.fuel].filter(Boolean).join(' · ')
+    : 'Not verified at submission';
+
+  const subject = f.isOptinOnly
+    ? 'Marketing sign-up (10% code) — ' + (f.email || f.phone)
+    : 'New enquiry — ' + (f.services[0] || 'General') + (f.registration ? ' — ' + f.registration : '');
+
+  return {
+    id: prefix + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36),
+    ts: new Date().toISOString(),
+    subject: subject,
+    name: (f.firstName + ' ' + f.lastName).trim(),
+    phone: f.phone,
+    email: f.email,
+    registration: f.registration,
+    vehicle: vehicleLine,
+    services: f.services.join(', ') || (f.isOptinOnly ? 'Marketing list sign-up' : ''),
+    message: f.message,
+    optin: f.optin,
+    source: f.source,
+    page: f.page,
+    hasImage: f.imageAttachments.length > 0,
+    imageCount: f.imageAttachments.length,
+    delivered: false
+  };
+}
+
 function buildBusinessEmail(record) {
   const rows = [
     ['Name', record.name], ['Phone', record.phone], ['Email', record.email],
@@ -208,7 +248,6 @@ function buildCustomerEmail(record, cfg) {
   return { subject: 'We\'ve got your enquiry — Baig Tyres', text, html };
 }
 
-/* ---------- Transports ---------- */
 let gmailTransport = null;
 let gmailKey = '';
 function getGmailTransport(cfg) {
@@ -253,7 +292,6 @@ async function sendBrevo(cfg, msg) {
   });
   return res.ok;
 }
-// Try the configured transport, in preference order. Returns true if the message was accepted.
 async function sendVia(cfg, msg) {
   try {
     if (cfg.GMAIL_APP_PASSWORD && nodemailer) return await sendGmail(cfg, msg);
@@ -264,6 +302,159 @@ async function sendVia(cfg, msg) {
 }
 function transportConfigured(cfg) {
   return !!((cfg.GMAIL_APP_PASSWORD && nodemailer) || cfg.RESEND_API_KEY || (cfg.BREVO_API_KEY && cfg.BREVO_SENDER_EMAIL));
+}
+
+function secretsMatch(supplied, expected) {
+  if (typeof supplied !== 'string' || typeof expected !== 'string' || !supplied || !expected) return false;
+  const a = crypto.createHash('sha256').update(supplied).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+async function handleHealthCheck(req, res) {
+  const stages = { vercel: true, validation: false, record_created: false, supabase_insert: false, supabase_read: false, email_suppressed: true, cleanup: false };
+  const checkedAt = new Date().toISOString();
+
+  const expectedSecret = process.env.HEALTH_CHECK_SECRET;
+  if (!expectedSecret) {
+    res.status(503).json({
+      ok: false,
+      error: 'config_missing',
+      message: 'HEALTH_CHECK_SECRET is not set for this Vercel environment.',
+      checked_at: checkedAt,
+      stages
+    });
+    return;
+  }
+
+  const suppliedSecret = req.headers['x-health-check-secret'];
+  if (!secretsMatch(suppliedSecret, expectedSecret)) {
+    res.status(401).json({ ok: false, error: 'unauthorized', checked_at: checkedAt, stages });
+    return;
+  }
+
+  const marker = 'HEALTHCHECK_' + Date.now().toString(36) + '_' + crypto.randomBytes(6).toString('hex');
+
+  const fields = {
+    firstName: 'Synthetic',
+    lastName: 'Health Check',
+    phone: '07700900123',
+    email: 'synthetic-health-check@baigtyres.invalid',
+    registration: 'HC26XYZ',
+    services: ['Synthetic health check'],
+    message: marker,
+    optin: false,
+    source: 'health_check',
+    page: '',
+    vehicle: null,
+    imageAttachments: [],
+    isOptinOnly: false
+  };
+
+  const validationError = validateEnquiryFields(fields);
+  if (validationError) {
+    res.status(500).json({
+      ok: false,
+      error: 'synthetic_payload_invalid',
+      message: validationError,
+      marker,
+      checked_at: checkedAt,
+      stages
+    });
+    return;
+  }
+  stages.validation = true;
+
+  const record = buildRecord(fields, 'hc');
+  stages.record_created = true;
+
+  const cfg = await CONFIG.get();
+  const db = getSupabase(cfg);
+  if (!db) {
+    res.status(500).json({
+      ok: false,
+      error: 'supabase_not_configured',
+      message: 'Supabase client unavailable — check SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are set and @supabase/supabase-js is installed.',
+      marker,
+      checked_at: checkedAt,
+      stages
+    });
+    return;
+  }
+
+  let insertError = null;
+  try {
+    const ok = await persistEnquiry(cfg, record);
+    if (!ok) insertError = new Error('persistEnquiry returned false');
+  } catch (e) {
+    insertError = e;
+  }
+
+  if (insertError) {
+    res.status(502).json({
+      ok: false,
+      error: 'supabase_insert_failed',
+      message: 'Could not write the synthetic row to the enquiries table.',
+      marker,
+      checked_at: checkedAt,
+      stages
+    });
+    return;
+  }
+  stages.supabase_insert = true;
+
+  let readRow = null;
+  let readError = null;
+  try {
+    const { data, error } = await db.from('enquiries').select('id, message').eq('id', record.id).maybeSingle();
+    readRow = data || null;
+    readError = error || null;
+  } catch (e) {
+    readError = e;
+  }
+  const readOk = !readError && !!readRow && readRow.id === record.id && readRow.message === marker;
+  stages.supabase_read = readOk;
+
+  let cleanupError = null;
+  try {
+    const { error } = await db.from('enquiries').delete().eq('id', record.id);
+    cleanupError = error || null;
+  } catch (e) {
+    cleanupError = e;
+  } finally {
+    stages.cleanup = !cleanupError;
+  }
+
+  if (!readOk) {
+    res.status(502).json({
+      ok: false,
+      error: 'supabase_read_failed',
+      message: 'Synthetic row did not read back correctly after insert.',
+      marker,
+      checked_at: checkedAt,
+      stages
+    });
+    return;
+  }
+
+  if (cleanupError) {
+    res.status(502).json({
+      ok: false,
+      error: 'cleanup_failed',
+      message: 'Synthetic row was inserted and verified but could not be deleted — check the enquiries table manually for id ' + record.id + '.',
+      marker,
+      checked_at: checkedAt,
+      stages
+    });
+    return;
+  }
+
+  res.status(200).json({
+    ok: true,
+    marker,
+    checked_at: checkedAt,
+    stages
+  });
 }
 
 module.exports = async (req, res) => {
@@ -277,7 +468,11 @@ module.exports = async (req, res) => {
   if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = {}; } }
   if (!body || typeof body !== 'object') body = {};
 
-  // Honeypot — real users never fill this hidden field. Pretend success to bots.
+  if (body.synthetic_health_check === true) {
+    await handleHealthCheck(req, res);
+    return;
+  }
+
   if (clean(body.company, 50)) { res.status(200).json({ ok: true }); return; }
 
   const firstName = clean(body.firstName, 60);
@@ -295,61 +490,22 @@ module.exports = async (req, res) => {
 
   const isOptinOnly = source === 'optin_popup';
 
-  if (isOptinOnly) {
-    if (!email && !phone) { res.status(400).json({ error: 'contact_required' }); return; }
-    if (email && !EMAIL_RE.test(email)) { res.status(400).json({ error: 'bad_email' }); return; }
-    if (phone && !PHONE_RE.test(phone)) { res.status(400).json({ error: 'bad_phone' }); return; }
-  } else {
-    if (!firstName || !lastName) { res.status(400).json({ error: 'name_required' }); return; }
-    if (!PHONE_RE.test(phone)) { res.status(400).json({ error: 'bad_phone' }); return; }
-    if (!EMAIL_RE.test(email)) { res.status(400).json({ error: 'bad_email' }); return; }
-    if (!PLATE_RE.test(registration)) { res.status(400).json({ error: 'bad_registration' }); return; }
-    if (services.length === 0) { res.status(400).json({ error: 'services_required' }); return; }
-  }
+  const validationError = validateEnquiryFields({ firstName, lastName, phone, email, registration, services, isOptinOnly });
+  if (validationError) { res.status(400).json({ error: validationError }); return; }
 
   const cfg = await CONFIG.get();
 
-  const vehicleLine = vehicle
-    ? [vehicle.make, vehicle.model, vehicle.colour, vehicle.year, vehicle.fuel].filter(Boolean).join(' · ')
-    : 'Not verified at submission';
+  const record = buildRecord({ firstName, lastName, phone, email, registration, vehicle, services, message, optin, source, page, imageAttachments, isOptinOnly }, 'e');
 
-  const subject = isOptinOnly
-    ? 'Marketing sign-up (10% code) — ' + (email || phone)
-    : 'New enquiry — ' + (services[0] || 'General') + (registration ? ' — ' + registration : '');
-
-  const record = {
-    id: 'e' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36),
-    ts: new Date().toISOString(),
-    subject: subject,
-    name: (firstName + ' ' + lastName).trim(),
-    phone: phone,
-    email: email,
-    registration: registration,
-    vehicle: vehicleLine,
-    services: services.join(', ') || (isOptinOnly ? 'Marketing list sign-up' : ''),
-    message: message,
-    optin: optin,
-    source: source,
-    page: page,
-    hasImage: imageAttachments.length > 0,
-    imageCount: imageAttachments.length,
-    delivered: false
-  };
-
-  // 1) Durable capture happens before any network email attempt. If the database
-  // is unavailable, continue trying email but leave an explicit runtime error.
   let persisted = false;
   try { persisted = await persistEnquiry(cfg, record); } catch (e) {
     console.error('ENQUIRY_PERSIST_FAILED:' + JSON.stringify({ id: record.id, message: e && e.message ? e.message : 'unknown' }));
   }
 
-  // Keep a short-retention recovery trace alongside the database row.
   const captured = await enqueue(cfg, record);
 
-  // 2) Instant business email + 3) customer confirmation (best-effort).
   let emailed = false;
   if (transportConfigured(cfg)) {
-    // Business notification to the enquiries inbox (with the customer's reference photo attached, if any).
     try {
       const biz = buildBusinessEmail(record);
       emailed = await sendVia(cfg, {
@@ -359,7 +515,6 @@ module.exports = async (req, res) => {
       });
     } catch (e) { emailed = false; }
 
-    // Customer confirmation — never blocks the response.
     if (String(cfg.CUSTOMER_CONFIRM) === '1' && email && EMAIL_RE.test(email)) {
       try {
         const cust = buildCustomerEmail(record, cfg);
@@ -374,18 +529,8 @@ module.exports = async (req, res) => {
     }
   }
 
-  // The customer-facing success state remains gated on the actual business email,
-  // not on the recovery log or database row.
-  // Fixed 2026-07-21: previously `captured || emailed` meant a broken email transport
-  // silently told every customer "we've got it" while the business received nothing.
   if (emailed) res.status(200).json({ ok: true });
   else res.status(502).json({ error: 'delivery_failed', captured: captured });
 };
 
-// Reference photos are base64-encoded in the JSON body. NOTE: Vercel hard-caps the actual
-// request body at 4.5MB regardless of this setting — it is a platform limit, not something
-// bodyParser.sizeLimit can raise. This was previously set to '6mb', which was never
-// achievable in practice and just masked the real ceiling; set below it so our own parser
-// (and MAX_IMAGE_BASE64_CHARS / MAX_TOTAL_IMAGE_BASE64_CHARS above) are the actual, honest
-// limits a request will hit.
 module.exports.config = { api: { bodyParser: { sizeLimit: '4mb' } } };
