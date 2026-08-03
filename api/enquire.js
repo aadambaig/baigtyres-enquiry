@@ -8,6 +8,22 @@
 //        b) Resend / Brevo transactional API — if a key is configured instead.
 //   3) Automatic confirmation email to the customer (same transport), if we have their email.
 // The HTTP response is a success as long as the enquiry was captured OR emailed.
+//
+// PROTECTED HEALTH-CHECK MODE: a request only enters health-check mode when it carries
+// BOTH `synthetic_health_check: true` in the body AND a header `x-health-check-secret`
+// matching the Vercel env var HEALTH_CHECK_SECRET (SHA-256 + timingSafeEqual comparison,
+// so neither presence/absence nor length of the real secret leaks via timing). It runs
+// through the exact same validation (validateEnquiryFields) and persistence
+// (persistEnquiry / markEmailSent) code the real enquiry flow uses — this is deliberate:
+// testing a hand-rolled copy of the schema/logic would drift from reality and prove
+// nothing. Unlike the normal flow it also genuinely attempts the real business-email
+// send (never a customer confirmation — there is no real customer), verifies the
+// Supabase row's email_sent flag afterward, and always deletes the synthetic row once
+// it has confirmed the row was actually written, regardless of what failed after that
+// point. See handleHealthCheck(). Intended to be called weekly by an external scheduler
+// (e.g. Zapier Webhooks, or a Cowork scheduled task) so a broken delivery pipeline can't
+// fail silently between real customer enquiries.
+const crypto = require('crypto');
 const CONFIG = require('./_config.js');
 
 let nodemailer = null;
@@ -147,7 +163,50 @@ async function markEmailSent(cfg, id) {
   return false;
 }
 
-/* ---------- Email bodies ---------- */
+function validateEnquiryFields(f) {
+  if (f.isOptinOnly) {
+    if (!f.email && !f.phone) return 'contact_required';
+    if (f.email && !EMAIL_RE.test(f.email)) return 'bad_email';
+    if (f.phone && !PHONE_RE.test(f.phone)) return 'bad_phone';
+    return null;
+  }
+  if (!f.firstName || !f.lastName) return 'name_required';
+  if (!PHONE_RE.test(f.phone)) return 'bad_phone';
+  if (!EMAIL_RE.test(f.email)) return 'bad_email';
+  if (!PLATE_RE.test(f.registration)) return 'bad_registration';
+  if (f.services.length === 0) return 'services_required';
+  return null;
+}
+
+function buildRecord(f, idOverride) {
+  const vehicleLine = f.vehicle
+    ? [f.vehicle.make, f.vehicle.model, f.vehicle.colour, f.vehicle.year, f.vehicle.fuel].filter(Boolean).join(' · ')
+    : 'Not verified at submission';
+
+  const subject = f.isOptinOnly
+    ? 'Marketing sign-up (10% code) — ' + (f.email || f.phone)
+    : 'New enquiry — ' + (f.services[0] || 'General') + (f.registration ? ' — ' + f.registration : '');
+
+  return {
+    id: idOverride || ('e' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36)),
+    ts: new Date().toISOString(),
+    subject: subject,
+    name: (f.firstName + ' ' + f.lastName).trim(),
+    phone: f.phone,
+    email: f.email,
+    registration: f.registration,
+    vehicle: vehicleLine,
+    services: f.services.join(', ') || (f.isOptinOnly ? 'Marketing list sign-up' : ''),
+    message: f.message,
+    optin: f.optin,
+    source: f.source,
+    page: f.page,
+    hasImage: f.imageAttachments.length > 0,
+    imageCount: f.imageAttachments.length,
+    delivered: false
+  };
+}
+
 function buildBusinessEmail(record) {
   const rows = [
     ['Name', record.name], ['Phone', record.phone], ['Email', record.email],
@@ -208,7 +267,6 @@ function buildCustomerEmail(record, cfg) {
   return { subject: 'We\'ve got your enquiry — Baig Tyres', text, html };
 }
 
-/* ---------- Transports ---------- */
 let gmailTransport = null;
 let gmailKey = '';
 function getGmailTransport(cfg) {
@@ -253,7 +311,6 @@ async function sendBrevo(cfg, msg) {
   });
   return res.ok;
 }
-// Try the configured transport, in preference order. Returns true if the message was accepted.
 async function sendVia(cfg, msg) {
   try {
     if (cfg.GMAIL_APP_PASSWORD && nodemailer) return await sendGmail(cfg, msg);
@@ -266,6 +323,205 @@ function transportConfigured(cfg) {
   return !!((cfg.GMAIL_APP_PASSWORD && nodemailer) || cfg.RESEND_API_KEY || (cfg.BREVO_API_KEY && cfg.BREVO_SENDER_EMAIL));
 }
 
+// SHA-256-then-timingSafeEqual: avoids both value AND length differences being
+// observable via timing (raw timingSafeEqual on unequal-length buffers throws instead
+// of comparing, which itself leaks length).
+function secretsMatch(supplied, expected) {
+  if (typeof supplied !== 'string' || typeof expected !== 'string' || !supplied || !expected) return false;
+  const a = crypto.createHash('sha256').update(supplied).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+// healthcheck-YYYYMMDD-HHMMSS, UTC. Deterministic and human-greppable in the Supabase
+// table/logs if a run is ever left to investigate manually.
+function healthCheckId(now) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return 'healthcheck-' + now.getUTCFullYear() + pad(now.getUTCMonth() + 1) + pad(now.getUTCDate()) +
+    '-' + pad(now.getUTCHours()) + pad(now.getUTCMinutes()) + pad(now.getUTCSeconds());
+}
+
+async function handleHealthCheck(req, res) {
+  const now = new Date();
+  const checkedAt = now.toISOString();
+  const stages = {
+    vercel: true,
+    secret_verified: false,
+    validation: false,
+    supabase_insert: false,
+    email_sent: false,
+    supabase_read: false,
+    email_flag_verified: false,
+    cleanup: false
+  };
+
+  const expectedSecret = process.env.HEALTH_CHECK_SECRET;
+  if (!expectedSecret) {
+    res.status(503).json({
+      ok: false, error: 'config_missing',
+      message: 'HEALTH_CHECK_SECRET is not set for this Vercel environment.',
+      checked_at: checkedAt, stages
+    });
+    return;
+  }
+
+  const suppliedSecret = req.headers['x-health-check-secret'];
+  if (!secretsMatch(suppliedSecret, expectedSecret)) {
+    res.status(401).json({ ok: false, error: 'unauthorized', checked_at: checkedAt, stages });
+    return;
+  }
+  stages.secret_verified = true;
+
+  const id = healthCheckId(now);
+
+  // Fixed, obviously-synthetic values — never taken from the request body. Phone is an
+  // Ofcom-reserved fictional-use number (07700 900000–900999); email uses the .invalid
+  // TLD reserved by RFC 2606, so it can never collide with or email a real customer.
+  const fields = {
+    firstName: 'Baig Tyres',
+    lastName: 'System Test',
+    phone: '07700900123',
+    email: 'synthetic-health-check@baigtyres.invalid',
+    registration: 'HC26XYZ',
+    services: ['Synthetic health check'],
+    isOptinOnly: false
+  };
+
+  // Runs the exact same validation real enquiries go through — proves the live rules
+  // (UK mobile format, plate format, required fields) still accept a well-formed
+  // submission, not a hand-rolled approximation of them.
+  const validationError = validateEnquiryFields(fields);
+  if (validationError) {
+    res.status(500).json({
+      ok: false, error: 'synthetic_payload_invalid', message: validationError,
+      id, checked_at: checkedAt, stages
+    });
+    return;
+  }
+  stages.validation = true;
+
+  const record = {
+    id: id,
+    ts: checkedAt,
+    subject: 'HEALTH CHECK — automated weekly check, no action needed unless this run alerted a failure',
+    name: fields.firstName + ' ' + fields.lastName,
+    phone: fields.phone,
+    email: fields.email,
+    registration: fields.registration,
+    vehicle: 'Not verified at submission',
+    services: fields.services.join(', '),
+    message: 'AUTOMATED WEEKLY HEALTH CHECK — NO CUSTOMER FOLLOW-UP REQUIRED',
+    optin: false, // never subscribes the synthetic identity to marketing
+    source: 'health_check',
+    page: '',
+    hasImage: false,
+    imageCount: 0,
+    delivered: false
+  };
+
+  const cfg = await CONFIG.get();
+  const db = getSupabase(cfg);
+  if (!db) {
+    res.status(500).json({
+      ok: false, error: 'supabase_not_configured',
+      message: 'Supabase client unavailable — check SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are set and @supabase/supabase-js is installed.',
+      id, checked_at: checkedAt, stages
+    });
+    return;
+  }
+
+  // 1) Insert through the exact same persistEnquiry() function real enquiries use.
+  let insertOk = false;
+  try { insertOk = await persistEnquiry(cfg, record); } catch (e) { insertOk = false; }
+
+  if (!insertOk) {
+    res.status(502).json({
+      ok: false, error: 'supabase_insert_failed',
+      message: 'Could not write the synthetic row to the enquiries table.',
+      id, checked_at: checkedAt, stages
+    });
+    return;
+  }
+  stages.supabase_insert = true;
+
+  // 2) Real send attempt to the real business inbox via the exact same sendVia()/
+  // buildBusinessEmail() real enquiries use — this is deliberate: a health check that
+  // never actually calls the transport proves nothing about whether Gmail/Resend/Brevo
+  // credentials still work. Never sends a customer confirmation (there is no real
+  // customer to confirm to).
+  let emailed = false;
+  if (transportConfigured(cfg)) {
+    try {
+      const biz = buildBusinessEmail(record);
+      emailed = await sendVia(cfg, { to: cfg.PRIMARY_TO, subject: record.subject, text: biz.text, html: biz.html });
+    } catch (e) { emailed = false; }
+  }
+  stages.email_sent = emailed;
+
+  if (emailed) {
+    try { await markEmailSent(cfg, record.id); } catch (e) { /* independently verified by the read-back below */ }
+  }
+
+  // 3) Read the row back by its known, deterministic id and confirm both the message
+  // text and the email_sent flag — the strongest signal already present in the schema
+  // that a real enquiry's email genuinely went out, not just that this function thinks it did.
+  let readRow = null;
+  let readError = null;
+  try {
+    const { data, error } = await db.from('enquiries').select('id, message, email_sent').eq('id', record.id).maybeSingle();
+    readRow = data || null;
+    readError = error || null;
+  } catch (e) { readError = e; }
+  const readOk = !readError && !!readRow && readRow.id === record.id && readRow.message === record.message;
+  stages.supabase_read = readOk;
+  stages.email_flag_verified = readOk && readRow.email_sent === true;
+
+  // 4) Cleanup always runs now that we know a row was inserted, regardless of what
+  // failed above — a failed email or a failed read must never leave a fake row behind
+  // to pollute genuine enquiry reporting.
+  let cleanupError = null;
+  try {
+    const { error } = await db.from('enquiries').delete().eq('id', record.id);
+    cleanupError = error || null;
+  } catch (e) { cleanupError = e; }
+  stages.cleanup = !cleanupError;
+
+  if (!readOk) {
+    res.status(502).json({
+      ok: false, error: 'supabase_read_failed',
+      message: 'Synthetic row did not read back correctly after insert.' + (cleanupError ? ' Cleanup also failed — check the enquiries table manually for id ' + record.id + '.' : ' Cleanup was attempted.'),
+      id, checked_at: checkedAt, stages
+    });
+    return;
+  }
+  if (!emailed) {
+    res.status(502).json({
+      ok: false, error: 'email_delivery_failed',
+      message: 'Business notification email was not sent — check GMAIL_APP_PASSWORD / RESEND_API_KEY / BREVO_* env vars.',
+      id, checked_at: checkedAt, stages
+    });
+    return;
+  }
+  if (!stages.email_flag_verified) {
+    res.status(502).json({
+      ok: false, error: 'email_flag_not_set',
+      message: 'The email appeared to send but enquiries.email_sent was not set on the row.',
+      id, checked_at: checkedAt, stages
+    });
+    return;
+  }
+  if (cleanupError) {
+    res.status(502).json({
+      ok: false, error: 'cleanup_failed',
+      message: 'Synthetic row was inserted and fully verified but could not be deleted — check the enquiries table manually for id ' + record.id + '.',
+      id, checked_at: checkedAt, stages
+    });
+    return;
+  }
+
+  res.status(200).json({ ok: true, id, checked_at: checkedAt, stages });
+}
+
 module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   if (req.method !== 'POST') { res.status(405).json({ error: 'method_not_allowed' }); return; }
@@ -276,6 +532,11 @@ module.exports = async (req, res) => {
   let body = req.body;
   if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = {}; } }
   if (!body || typeof body !== 'object') body = {};
+
+  if (body.synthetic_health_check === true) {
+    await handleHealthCheck(req, res);
+    return;
+  }
 
   // Honeypot — real users never fill this hidden field. Pretend success to bots.
   if (clean(body.company, 50)) { res.status(200).json({ ok: true }); return; }
@@ -295,46 +556,12 @@ module.exports = async (req, res) => {
 
   const isOptinOnly = source === 'optin_popup';
 
-  if (isOptinOnly) {
-    if (!email && !phone) { res.status(400).json({ error: 'contact_required' }); return; }
-    if (email && !EMAIL_RE.test(email)) { res.status(400).json({ error: 'bad_email' }); return; }
-    if (phone && !PHONE_RE.test(phone)) { res.status(400).json({ error: 'bad_phone' }); return; }
-  } else {
-    if (!firstName || !lastName) { res.status(400).json({ error: 'name_required' }); return; }
-    if (!PHONE_RE.test(phone)) { res.status(400).json({ error: 'bad_phone' }); return; }
-    if (!EMAIL_RE.test(email)) { res.status(400).json({ error: 'bad_email' }); return; }
-    if (!PLATE_RE.test(registration)) { res.status(400).json({ error: 'bad_registration' }); return; }
-    if (services.length === 0) { res.status(400).json({ error: 'services_required' }); return; }
-  }
+  const validationError = validateEnquiryFields({ firstName, lastName, phone, email, registration, services, isOptinOnly });
+  if (validationError) { res.status(400).json({ error: validationError }); return; }
 
   const cfg = await CONFIG.get();
 
-  const vehicleLine = vehicle
-    ? [vehicle.make, vehicle.model, vehicle.colour, vehicle.year, vehicle.fuel].filter(Boolean).join(' · ')
-    : 'Not verified at submission';
-
-  const subject = isOptinOnly
-    ? 'Marketing sign-up (10% code) — ' + (email || phone)
-    : 'New enquiry — ' + (services[0] || 'General') + (registration ? ' — ' + registration : '');
-
-  const record = {
-    id: 'e' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36),
-    ts: new Date().toISOString(),
-    subject: subject,
-    name: (firstName + ' ' + lastName).trim(),
-    phone: phone,
-    email: email,
-    registration: registration,
-    vehicle: vehicleLine,
-    services: services.join(', ') || (isOptinOnly ? 'Marketing list sign-up' : ''),
-    message: message,
-    optin: optin,
-    source: source,
-    page: page,
-    hasImage: imageAttachments.length > 0,
-    imageCount: imageAttachments.length,
-    delivered: false
-  };
+  const record = buildRecord({ firstName, lastName, phone, email, registration, vehicle, services, message, optin, source, page, imageAttachments, isOptinOnly });
 
   // 1) Durable capture happens before any network email attempt. If the database
   // is unavailable, continue trying email but leave an explicit runtime error.
