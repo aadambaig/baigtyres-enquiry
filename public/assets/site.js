@@ -518,7 +518,7 @@
       if (baseService && services.indexOf(baseService) === -1) services.unshift(baseService);
 
       if(!firstName||!lastName){ showResult('Add your first and last name so we know who to ask for.',false); return; }
-      if(!phone){ showResult('Add your mobile number so we can call or WhatsApp you back.',false); phoneInput&&phoneInput.focus(); return; }
+      if(!phone){ showResult('Add your mobile number so we can get back to you.',false); phoneInput&&phoneInput.focus(); return; }
       if(!phoneValid(phone)){
         checkPhoneLive();
         showResult('That mobile number isn\'t valid — enter a UK mobile like 07911 123456.',false);
@@ -548,7 +548,7 @@
           })
         }).then(function(res){
           if(!res.ok) throw new Error();
-          showResult("Got it — we'll call or WhatsApp you back within one working day.",true);
+          showResult("Got it — we'll get back to you within one working day.",true);
           form.reset(); selected.clear(); renderChips(); resetFileField();
           if (phoneInput) phoneInput.classList.remove('invalid');
           if (phoneErr) phoneErr.classList.remove('show');
