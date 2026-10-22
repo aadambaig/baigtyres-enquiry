@@ -241,13 +241,13 @@ function buildCustomerEmail(record, cfg) {
     ['Registration', record.registration], ['Vehicle', record.vehicle],
     ['Services', record.services], ['Your message', record.message]
   ].filter(([, v]) => v && v !== 'Not verified at submission');
-  const text = 'Hi ' + firstName + ',\n\nThanks for your enquiry to Baig Tyres — we\'ve received it and will contact you back within one working day (during working hours).\n\n' +
+  const text = 'Hi ' + firstName + ',\n\nThanks for your enquiry to Baig Tyres — we\'ve received it and will get back to you within one working day (during working hours).\n\n' +
     summary.map(([k, v]) => k + ': ' + v).join('\n') +
     (record.optin ? '\n\nAs a thank you for joining our list, here is 10% off your first order — code ' + code + '.' : '') +
     '\n\nBaig Tyres Ltd, Unit 4, Derwent Close, Worcester, WR4 9TY\n01905 731396';
   const html = '<div style="font-family:Arial,sans-serif;font-size:15px;color:#111;max-width:520px">' +
     '<h2>Thanks, ' + htmlEscape(firstName) + ' — we\'ve got your enquiry ✓</h2>' +
-    '<p>We\'ll contact you back within one working day (during working hours). Here\'s a copy of what you sent us:</p>' +
+    '<p>We\'ll get back to you within one working day (during working hours). Here\'s a copy of what you sent us:</p>' +
     '<table cellpadding="7" style="border-collapse:collapse;font-size:14px">' +
     summary.map(([k, v]) => '<tr><td style="background:#f2f4f7;font-weight:bold;border:1px solid #e2e6ea">' +
       htmlEscape(k) + '</td><td style="border:1px solid #e2e6ea">' + htmlEscape(v) + '</td></tr>').join('') +
